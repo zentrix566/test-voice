@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>豆包语音问答 Demo</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            max-width: 800px;
+            margin: 40px auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 30px;
+        }
+        .config {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .config label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: bold;
+            color: #555;
+        }
+        .config input {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        .recorder {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            text-align: center;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        #recordBtn {
+            padding: 15px 40px;
+            font-size: 18px;
+            border: none;
+            border-radius: 50px;
+            cursor: pointer;
+            background-color: #ff4444;
+            color: white;
+            transition: all 0.3s;
+        }
+        #recordBtn:hover {
+            transform: scale(1.05);
+        }
+        #recordBtn.recording {
+            background-color: #cccccc;
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(255, 68, 68, 0.7); }
+            70% { box-shadow: 0 0 0 10px rgba(255, 68, 68, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(255, 68, 68, 0); }
+        }
+        .status {
+            margin-top: 15px;
+            font-size: 16px;
+            color: #666;
+        }
+        .result {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .result h3 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 16px;
+        }
+        .result .content {
+            padding: 15px;
+            background: #f9f9f9;
+            border-radius: 4px;
+            min-height: 60px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            color: #333;
+            line-height: 1.6;
+        }
+        .loading {
+            color: #999;
+            font-style: italic;
+        }
+        .error {
+            color: #ff4444;
+        }
+        .log {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 15px;
+            border-radius: 4px;
+            max-height: 200px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+        .log .log-entry {
+            margin: 3px 0;
+        }
+        .log .log-time {
+            color: #858585;
+            margin-right: 8px;
+        }
+        .log .log-info {
+            color: #d4d4d4;
+        }
+        .log .log-error {
+            color: #f48771;
+        }
+        .log .log-warn {
+            color: #cca76a;
+        }
+        .log .log-debug {
+            color: #589df6;
+        }
+        .clear-log {
+            margin-top: 10px;
+            padding: 8px 16px;
+            background: #333;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .clear-log:hover {
+            background: #444;
+        }
+    </style>
+</head>
+<body>
+    <h1>🎤 豆包语音问答 Demo</h1>
+
+    <div class="config" id="configSection" style="display: none;">
+        <label for="apiKey">豆包 API Key</label>
+        <input type="password" id="apiKey" placeholder="请输入你的豆包 API Key">
+    </div>
+
+    <div class="recorder">
+        <button id="recordBtn">按住说话 / 点击开始录音</button>
+        <div class="status" id="status">就绪，可以开始录音</div>
+    </div>
+
+    <div class="result">
+        <h3>识别到的问题</h3>
+        <div class="content" id="questionResult">等待录音...</div>
+    </div>
+
+    <div class="result">
+        <h3>豆包回答</h3>
+        <div class="content" id="answerResult">等待提问...</div>
+    </div>
+
+    <div class="result">
+        <h3>调试日志 <button class="clear-log" id="clearLogBtn">清空日志</button></h3>
+        <div class="log" id="logContainer"></div>
+    </div>
+
+    <script src="config.local.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
