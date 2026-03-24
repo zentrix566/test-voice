@@ -8,9 +8,15 @@
   },
   "dependencies": {
     "http-proxy-middleware": "^2.0.6",
+    "uuid": "^13.0.0",
     "ws": "^8.14.2"
   },
-  "keywords": ["doubao", "asr", "speech-recognition", "voice-qa"],
+  "keywords": [
+    "doubao",
+    "asr",
+    "speech-recognition",
+    "voice-qa"
+  ],
   "author": "zentrix566",
   "license": "MIT"
 }

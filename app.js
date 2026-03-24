@@ -121,6 +121,10 @@ class VoiceQA {
     }
 
     extractAppIdFromApiKey(apiKey) {
+        // 如果配置文件中指定了 ASR_MODEL_ID，直接使用
+        if (typeof CONFIG !== 'undefined' && CONFIG.ASR_MODEL_ID) {
+            return CONFIG.ASR_MODEL_ID;
+        }
         const parts = apiKey.split('_');
         if (parts.length > 1) {
             return parts[0];
@@ -159,6 +163,7 @@ class VoiceQA {
                     const pcm16 = this.convertTo16BitPCM(resampled);
                     this.audioBuffer.push(...pcm16);
                     this.log('debug', `发送音频块: ${pcm16.length * 2} bytes`);
+                    // 发送二进制数据，需要用 Buffer 而不是 Int16Array.buffer
                     this.websocket.send(pcm16.buffer);
                 }
             };
@@ -187,11 +192,12 @@ class VoiceQA {
             this.websocket.onopen = () => {
                 this.log('debug', 'WebSocket 连接已建立');
 
+                const appId = this.extractAppIdFromApiKey(apiKey);
                 const startMessage = {
                     app: {
-                        appid: this.extractAppIdFromApiKey(apiKey),
+                        appid: appId.includes('ep-') ? '' : this.extractAppIdFromApiKey(apiKey),
                         token: apiKey,
-                        cluster: 'volcengine_streaming_asr_online'
+                        cluster: appId.includes('ep-') ? appId : 'volcengine_streaming_asr_online'
                     },
                     user: {
                         uid: 'doubao-voice-demo'
@@ -200,7 +206,8 @@ class VoiceQA {
                         reqid: this.generateReqId(),
                         audio_format: 'pcm',
                         enable_punctuation: true,
-                        enable_itn: true
+                        enable_itn: true,
+                        sample_rate: 16000
                     }
                 };
                 this.websocket.send(JSON.stringify(startMessage));
@@ -231,6 +238,9 @@ class VoiceQA {
     }
 
     handleStreamMessage(message) {
+        // 打印完整响应用于调试
+        this.log('debug', `收到服务器响应: ${JSON.stringify(message)}`);
+
         // 火山引擎流式ASR响应格式：
         // {
         //   "payload": {
@@ -292,7 +302,15 @@ class VoiceQA {
             this.audioContext.close();
             this.audioContext = null;
         }
+        // 发送完成帧告诉服务器音频已结束（发送空二进制数据）
         if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
+            // 发送零长度的二进制表示结束，服务端会据此发送最后一包给火山
+            this.websocket.send(new ArrayBuffer(0));
+            // 等待服务器返回最终结果再关闭
+            setTimeout(() => {
+                this.websocket.close();
+            }, 500);
+        } else {
             this.websocket.close();
         }
         this.stream.getTracks().forEach(track => track.stop());
