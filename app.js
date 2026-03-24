@@ -1,9 +1,15 @@
 class VoiceQA {
     constructor() {
-        this.mediaRecorder = null;
-        this.audioChunks = [];
         this.stream = null;
+        this.audioContext = null;
+        this.scriptProcessor = null;
+        this.sourceNode = null;
         this.isRecording = false;
+        this.websocket = null;
+        this.fullRecognizedText = '';
+        this.audioBuffer = [];
+
+        this.targetSampleRate = 16000;
 
         this.apiKeyInput = document.getElementById('apiKey');
         this.recordBtn = document.getElementById('recordBtn');
@@ -13,15 +19,12 @@ class VoiceQA {
         this.logContainer = document.getElementById('logContainer');
         this.clearLogBtn = document.getElementById('clearLogBtn');
 
-        // 从本地配置读取 API Key
         this.loadApiKeyFromConfig();
-
         this.initEventListeners();
-        this.log('info', '应用初始化完成，等待开始录音');
+        this.log('info', '应用初始化完成，火山流式ASR已开启，等待开始录音');
     }
 
     loadApiKeyFromConfig() {
-        // 如果有本地配置文件，自动填充 API Key
         if (typeof CONFIG !== 'undefined' && CONFIG.DOUBAN_API_KEY) {
             this.apiKeyInput.value = CONFIG.DOUBAN_API_KEY;
             this.log('info', '已从 config.local.js 加载 API Key');
@@ -29,7 +32,6 @@ class VoiceQA {
     }
 
     initEventListeners() {
-        // 支持点击切换录音和长按录音两种模式
         this.recordBtn.addEventListener('click', () => {
             if (!this.isRecording) {
                 this.startRecording();
@@ -38,7 +40,6 @@ class VoiceQA {
             }
         });
 
-        // 支持按住录音
         this.recordBtn.addEventListener('mousedown', () => {
             if (!this.isRecording) {
                 this.startRecording();
@@ -51,7 +52,6 @@ class VoiceQA {
             }
         });
 
-        // 移动端触摸支持
         this.recordBtn.addEventListener('touchstart', (e) => {
             e.preventDefault();
             if (!this.isRecording) {
@@ -65,16 +65,13 @@ class VoiceQA {
             }
         });
 
-        // 清空日志按钮
         this.clearLogBtn.addEventListener('click', () => this.clearLogs());
     }
 
     log(level, message) {
-        // 同时输出到控制台和页面日志
         const now = new Date();
         const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
 
-        // 控制台输出
         switch (level) {
             case 'error':
                 console.error(`[${timeStr}]`, message);
@@ -89,7 +86,6 @@ class VoiceQA {
                 console.log(`[${timeStr}]`, message);
         }
 
-        // 页面输出
         const entry = document.createElement('div');
         entry.className = `log-entry log-${level}`;
         entry.innerHTML = `<span class="log-time">[${timeStr}]</span> ${this.escapeHtml(message)}`;
@@ -109,21 +105,12 @@ class VoiceQA {
     }
 
     getApiKey() {
-        // API Key 用于认证
-        if (typeof CONFIG !== 'undefined' && CONFIG.API_KEY) {
-            return CONFIG.API_KEY;
+        if (typeof CONFIG !== 'undefined' && CONFIG.DOUBAN_API_KEY) {
+            return CONFIG.DOUBAN_API_KEY;
         }
         const inputKey = this.apiKeyInput.value.trim();
         if (inputKey) return inputKey;
-
         return null;
-    }
-
-    getAsrModelId() {
-        if (typeof CONFIG !== 'undefined' && CONFIG.ASR_MODEL_ID) {
-            return CONFIG.ASR_MODEL_ID;
-        }
-        return this.getApiKey();
     }
 
     getChatModelId() {
@@ -133,37 +120,54 @@ class VoiceQA {
         return this.getApiKey();
     }
 
+    extractAppIdFromApiKey(apiKey) {
+        const parts = apiKey.split('_');
+        if (parts.length > 1) {
+            return parts[0];
+        }
+        return apiKey;
+    }
+
     async startRecording() {
         const apiKey = this.getApiKey();
-        if (!apiKey) {
+        const apiKeyRequired = typeof CONFIG === 'undefined' || !CONFIG.DOUBAN_API_KEY;
+        if (apiKeyRequired && !apiKey) {
             this.showError('请先输入豆包 API Key', this.questionResult);
             this.log('error', 'API Key 为空，请输入 API Key');
             return;
         }
 
         try {
+            this.fullRecognizedText = '';
+            this.audioBuffer = [];
             this.log('info', '正在请求麦克风权限...');
             this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            this.mediaRecorder = new MediaRecorder(this.stream);
-            this.audioChunks = [];
 
-            this.mediaRecorder.ondataavailable = (event) => {
-                if (event.data.size > 0) {
-                    this.audioChunks.push(event.data);
-                    this.log('debug', `收到音频数据: ${event.data.size} bytes`);
+            await this.connectStreamRecognize(apiKey);
+
+            this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            this.sourceNode = this.audioContext.createMediaStreamSource(this.stream);
+            this.scriptProcessor = this.audioContext.createScriptProcessor(4096, 1, 1);
+
+            this.sourceNode.connect(this.scriptProcessor);
+            this.scriptProcessor.connect(this.audioContext.destination);
+
+            this.scriptProcessor.onaudioprocess = (event) => {
+                if (this.isRecording && this.websocket && this.websocket.readyState === WebSocket.OPEN) {
+                    const inputBuffer = event.inputBuffer.getChannelData(0);
+                    const resampled = this.resample(inputBuffer, this.audioContext.sampleRate, this.targetSampleRate);
+                    const pcm16 = this.convertTo16BitPCM(resampled);
+                    this.audioBuffer.push(...pcm16);
+                    this.log('debug', `发送音频块: ${pcm16.length * 2} bytes`);
+                    this.websocket.send(pcm16.buffer);
                 }
             };
 
-            this.mediaRecorder.onstop = () => {
-                this.log('info', '录音已停止，开始处理');
-                this.processAudio();
-            };
-
-            this.mediaRecorder.start();
             this.isRecording = true;
             this.recordBtn.classList.add('recording');
-            this.statusDiv.textContent = '正在录音...';
-            this.log('info', '开始录音');
+            this.statusDiv.textContent = '正在录音...（流式识别中）';
+            this.showLoading('正在录音，流式识别中...说话结束后停止录音', this.questionResult);
+            this.log('info', '开始录音，流式识别已启动');
         } catch (error) {
             const errorMsg = `获取麦克风失败: ${error.message}`;
             this.log('error', errorMsg);
@@ -172,39 +176,156 @@ class VoiceQA {
         }
     }
 
-    async stopRecording() {
-        if (!this.isRecording || !this.mediaRecorder) return;
+    async connectStreamRecognize(apiKey) {
+        return new Promise((resolve, reject) => {
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${wsProtocol}//${window.location.host}/api/ws-asr`;
 
-        this.log('info', '停止录音');
-        this.mediaRecorder.stop();
+            this.log('info', `连接流式识别服务: ${wsUrl}`);
+            this.websocket = new WebSocket(wsUrl);
+
+            this.websocket.onopen = () => {
+                this.log('debug', 'WebSocket 连接已建立');
+
+                const startMessage = {
+                    app: {
+                        appid: this.extractAppIdFromApiKey(apiKey),
+                        token: apiKey,
+                        cluster: 'volcengine_streaming_asr_online'
+                    },
+                    user: {
+                        uid: 'doubao-voice-demo'
+                    },
+                    request: {
+                        reqid: this.generateReqId(),
+                        audio_format: 'pcm',
+                        enable_punctuation: true,
+                        enable_itn: true
+                    }
+                };
+                this.websocket.send(JSON.stringify(startMessage));
+                this.log('debug', '发送启动指令完成');
+                resolve();
+            };
+
+            this.websocket.onmessage = (event) => {
+                if (typeof event.data === 'string') {
+                    try {
+                        const message = JSON.parse(event.data);
+                        this.handleStreamMessage(message);
+                    } catch (e) {
+                        this.log('warn', `解析JSON失败: ${e.message}, 数据长度: ${event.data.length}`);
+                    }
+                }
+            };
+
+            this.websocket.onerror = (error) => {
+                this.log('error', `WebSocket 错误: ${error}`);
+                reject(error);
+            };
+
+            this.websocket.onclose = (event) => {
+                this.log('info', `WebSocket 连接关闭: code=${event.code} reason=${event.reason}`);
+            };
+        });
+    }
+
+    handleStreamMessage(message) {
+        // 火山引擎流式ASR响应格式：
+        // {
+        //   "payload": {
+        //     "result": {
+        //       "text": "识别到的文字",
+        //       "duration": 123,
+        //       "done": false
+        //     }
+        //   }
+        // }
+        if (message.payload && message.payload.result) {
+            const result = message.payload.result;
+            if (result.text !== undefined) {
+                this.fullRecognizedText = result.text;
+                this.showResult(this.fullRecognizedText, this.questionResult);
+                this.log('debug', `流式更新: "${this.fullRecognizedText}"`);
+            }
+            if (result.done) {
+                this.log('info', `识别完成，最终结果: "${this.fullRecognizedText}"`);
+            }
+        }
+    }
+
+    resample(inputBuffer, originalSampleRate, targetSampleRate) {
+        const ratio = originalSampleRate / targetSampleRate;
+        const outputLength = Math.round(inputBuffer.length / ratio);
+        const output = new Float32Array(outputLength);
+
+        for (let i = 0; i < outputLength; i++) {
+            const position = i * ratio;
+            const index = Math.floor(position);
+            const frac = position - index;
+            if (index + 1 < inputBuffer.length) {
+                output[i] = inputBuffer[index] * (1 - frac) + inputBuffer[index + 1] * frac;
+            } else {
+                output[i] = inputBuffer[index];
+            }
+        }
+        return output;
+    }
+
+    convertTo16BitPCM(floatBuffer) {
+        const output = new Int16Array(floatBuffer.length);
+        for (let i = 0; i < floatBuffer.length; i++) {
+            let sample = Math.max(-1, Math.min(1, floatBuffer[i]));
+            output[i] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+        }
+        return output;
+    }
+
+    finishStreamRecognize() {
+        if (this.scriptProcessor) {
+            this.scriptProcessor.disconnect();
+            this.sourceNode.disconnect();
+            this.scriptProcessor = null;
+            this.sourceNode = null;
+        }
+        if (this.audioContext) {
+            this.audioContext.close();
+            this.audioContext = null;
+        }
+        if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
+            this.websocket.close();
+        }
         this.stream.getTracks().forEach(track => track.stop());
         this.isRecording = false;
         this.recordBtn.classList.remove('recording');
-        this.statusDiv.textContent = '正在处理...';
-    }
 
-    async processAudio() {
-        const audioBlob = new Blob(this.audioChunks, { type: 'audio/wav' });
-        this.log('info', `录音大小: ${audioBlob.size} bytes`);
+        if (!this.fullRecognizedText || this.fullRecognizedText.trim().length === 0) {
+            this.log('error', '未识别到任何内容');
+            this.showError('未识别到语音内容，请重试', this.questionResult);
+            this.statusDiv.textContent = '识别失败，请重试';
+            return;
+        }
+
+        const questionText = this.fullRecognizedText.trim();
+        this.log('info', `流式识别完成，最终结果: "${questionText}"`);
 
         try {
-            // 1. 语音识别
-            this.showLoading('正在进行语音识别...', this.questionResult);
-            this.log('info', '开始调用语音识别 API...');
-            const questionText = await this.recognizeSpeech(audioBlob);
-            this.showResult(questionText, this.questionResult);
-            this.log('info', `语音识别完成，识别结果: "${questionText}"`);
-
-            // 2. 获取回答
             this.showLoading('正在思考回答...', this.answerResult);
             this.log('info', '开始调用对话 API 获取回答...');
-            const answerText = await this.getAnswer(questionText);
-            this.showResult(answerText, this.answerResult);
-            this.log('info', '获取回答完成');
-
-            this.statusDiv.textContent = '处理完成，请开始下一轮提问';
+            this.getAnswerStreaming(questionText).then(answerText => {
+                this.showResult(answerText, this.answerResult);
+                this.log('info', '获取回答完成');
+                this.statusDiv.textContent = '处理完成，请开始下一轮提问';
+            }).catch(error => {
+                const errorMsg = `获取回答失败: ${error.message}`;
+                this.log('error', errorMsg);
+                this.log('error', `完整错误信息: ${error.stack || '无堆栈信息'}`);
+                console.error('处理失败:', error);
+                this.showError(errorMsg, this.answerResult);
+                this.statusDiv.textContent = '处理失败，请重试';
+            });
         } catch (error) {
-            const errorMsg = `处理失败: ${error.message}`;
+            const errorMsg = `获取回答失败: ${error.message}`;
             this.log('error', errorMsg);
             this.log('error', `完整错误信息: ${error.stack || '无堆栈信息'}`);
             console.error('处理失败:', error);
@@ -213,158 +334,107 @@ class VoiceQA {
         }
     }
 
-    async recognizeSpeech(audioBlob) {
-        const apiKey = this.getApiKey();
-        const modelId = this.getAsrModelId();
+    stopRecording() {
+        if (!this.isRecording) return;
 
-        // 使用 Ark 多模态 API 直接进行语音识别
-        // 语音识别模型 endpoint
-        const apiUrl = '/api/chat';
+        this.log('info', '停止录音');
+        this.isRecording = false;
+        this.recordBtn.classList.remove('recording');
+        this.statusDiv.textContent = '正在等待最终识别结果...';
 
-        this.log('debug', `使用 Ark 多模态识别语音，模型: ${modelId}`);
-
-        // 将音频转为 base64
-        const base64Audio = await this.blobToBase64(audioBlob);
-        const base64Data = base64Audio.split(',')[1];
-        this.log('debug', `Base64 长度: ${base64Data.length} characters`);
-
-        // 使用多模态，将音频发送给豆包，让它识别文字
-        // 构造一个包含音频的消息，让豆包转录
-        const requestBody = {
-            model: modelId,
-            messages: [
-                {
-                    role: 'user',
-                    content: [
-                        {
-                            type: 'text',
-                            text: '请识别这一段录音中的文字内容，只输出识别出的文字，不要说其他话。'
-                        },
-                        {
-                            type: 'audio',
-                            audio: {
-                                data: base64Data,
-                                format: 'wav'
-                            }
-                        }
-                    ]
-                }
-            ],
-            temperature: 0
-        };
-
-        this.log('debug', `使用 Ark 多模态请求，model endpoint: ${apiKey}`);
-
-        let response;
-        try {
-            response = await fetch(apiUrl, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${apiKey}`
-                },
-                body: JSON.stringify(requestBody)
-            });
-        } catch (fetchError) {
-            this.log('error', `Fetch 失败: ${fetchError.message}. 这通常是跨域问题`);
-            throw fetchError;
-        }
-
-        this.log('debug', `API 响应状态: ${response.status} ${response.statusText}`);
-
-        if (!response.ok) {
-            const errorText = await response.text();
-            this.log('error', `API 响应内容: ${errorText}`);
-            throw new Error(`语音识别 API 错误: ${response.status} - ${errorText}`);
-        }
-
-        const result = await response.json();
-        this.log('debug', `完整响应: ${JSON.stringify(result, null, 2)}`);
-
-        const text = result.choices[0].message.content.trim();
-
-        if (!text) {
-            throw new Error('未识别到语音内容');
-        }
-
-        this.log('info', `多模态识别结果: "${text}"`);
-        return text;
+        setTimeout(() => {
+            this.finishStreamRecognize();
+        }, 500);
     }
 
-    async getAnswer(question) {
+    async getAnswerStreaming(question) {
         const apiKey = this.getApiKey();
         const modelId = this.getChatModelId();
-
-        // 使用本地代理解决跨域问题
         const apiUrl = '/api/chat';
 
-        this.log('debug', `发送对话请求到: ${apiUrl}，模型: ${modelId}`);
+        this.log('debug', `发送流式对话请求到: ${apiUrl}，模型: ${modelId}`);
 
         const requestBody = {
             model: modelId,
             messages: [
                 {
                     role: 'system',
-                    content: '你是一个乐于助人的AI助手，请简洁明了地回答用户的问题。'
+                    content: '你现在正在面试，请简洁准确地回答面试官提出的问题。'
                 },
                 {
                     role: 'user',
                     content: question
                 }
             ],
+            stream: true,
             temperature: 0.7
         };
 
-        let response;
-        try {
-            response = await fetch(apiUrl, {
+        let fullAnswerText = '';
+
+        return new Promise((resolve, reject) => {
+            fetch(apiUrl, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                     'Authorization': `Bearer ${apiKey}`
                 },
                 body: JSON.stringify(requestBody)
+            }).then(response => {
+                if (!response.ok) {
+                    response.text().then(errorText => {
+                        this.log('error', `API 错误: ${response.status} - ${errorText}`);
+                        reject(new Error(`对话 API 错误: ${response.status} - ${errorText}`));
+                    });
+                    return;
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+
+                const readChunk = () => {
+                    reader.read().then(({done, value}) => {
+                        if (done) {
+                            this.log('debug', `流式回答完成`);
+                            resolve(fullAnswerText);
+                            return;
+                        }
+
+                        const chunk = decoder.decode(value, {stream: true});
+                        const lines = chunk.split('\n');
+                        for (const line of lines) {
+                            if (line.startsWith('data: ')) {
+                                const data = line.slice(6);
+                                if (data === '[DONE]') {
+                                    continue;
+                                }
+                                try {
+                                    const json = JSON.parse(data);
+                                    if (json.choices && json.choices[0].delta.content) {
+                                        fullAnswerText += json.choices[0].delta.content;
+                                        this.showResult(fullAnswerText, this.answerResult);
+                                    }
+                                } catch (e) {
+                                }
+                            }
+                        }
+
+                        readChunk();
+                    }).catch(error => {
+                        reject(error);
+                    });
+                };
+
+                readChunk();
+            }).catch(error => {
+                this.log('error', `Fetch 失败: ${error.message}`);
+                reject(error);
             });
-        } catch (fetchError) {
-            this.log('error', `Fetch 失败: ${fetchError.message}. 这通常是跨域问题`);
-            throw fetchError;
-        }
-
-        this.log('debug', `API 响应状态: ${response.status} ${response.statusText}`);
-
-        if (!response.ok) {
-            const errorText = await response.text();
-            this.log('error', `API 响应内容: ${errorText}`);
-            throw new Error(`对话 API 错误: ${response.status} - ${errorText}`);
-        }
-
-        const result = await response.json();
-        this.log('debug', `完整响应: ${JSON.stringify(result, null, 2)}`);
-
-        return result.choices[0].message.content;
-    }
-
-    blobToBase64(blob) {
-        return new Promise((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onload = () => resolve(reader.result);
-            reader.onerror = () => {
-                this.log('error', 'Blob 转 Base64 失败');
-                reject(reader.error);
-            };
-            reader.readAsDataURL(blob);
         });
     }
 
-    extractAppIdFromApiKey(apiKey) {
-        // 如果是完整的 API Key 包含 appid，可以提取出来
-        // 这里处理常见格式，如果不对需要用户手动确认
-        const parts = apiKey.split('_');
-        if (parts.length > 1) {
-            return parts[0];
-        }
-        // 如果是 UUID 格式，直接返回整个作为 appid
-        return apiKey;
+    generateReqId() {
+        return Math.random().toString(36).substring(2, 15);
     }
 
     showLoading(text, element) {
@@ -380,12 +450,10 @@ class VoiceQA {
     }
 }
 
-// 页面加载完成后初始化
 document.addEventListener('DOMContentLoaded', () => {
     new VoiceQA();
 });
 
-// 检查浏览器支持
 if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     alert('你的浏览器不支持录音功能，请使用最新版 Chrome / Edge 浏览器');
 }

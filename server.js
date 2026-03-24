@@ -7,8 +7,12 @@ const url = require('url');
 const fs = require('fs');
 const path = require('path');
 const { createProxyMiddleware } = require('http-proxy-middleware');
+const WebSocket = require('ws');
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.DOUBAN_API_KEY;
+const ASR_MODEL_ID = process.env.ASR_MODEL_ID;
+const CHAT_MODEL_ID = process.env.CHAT_MODEL_ID;
 
 // MIME types
 const mimeTypes = {
@@ -40,6 +44,12 @@ const asrProxy = createProxyMiddleware({
         console.log(`[${new Date().toLocaleTimeString()}] ASR 请求转发`);
         // 如果 body 已经被解析，重新发送
         if (req.body) {
+            // 如果环境变量中配置了 API Key，使用环境变量的
+            if (API_KEY) {
+                if (req.body.header) {
+                    req.body.header.token = API_KEY;
+                }
+            }
             const bodyData = JSON.stringify(req.body);
             proxyReq.setHeader('Content-Type', 'application/json');
             proxyReq.setHeader('Content-Length', Buffer.byteLength(bodyData));
@@ -68,11 +78,18 @@ const chatProxy = createProxyMiddleware({
     onProxyReq: (proxyReq, req, res) => {
         console.log(`[${new Date().toLocaleTimeString()}] 对话请求转发`);
         if (req.body) {
-            const bodyData = JSON.stringify(req.body);
-            proxyReq.setHeader('Content-Type', 'application/json');
-            if (req.headers.authorization) {
+            // 如果环境变量中配置了 API Key，使用环境变量的
+            if (API_KEY) {
+                proxyReq.setHeader('Authorization', `Bearer ${API_KEY}`);
+            } else if (req.headers.authorization) {
                 proxyReq.setHeader('Authorization', req.headers.authorization);
             }
+            // 如果环境变量中配置了模型 ID，覆盖请求中的 model
+            if (CHAT_MODEL_ID && req.body && typeof req.body === 'object') {
+                req.body.model = CHAT_MODEL_ID;
+            }
+            const bodyData = JSON.stringify(req.body);
+            proxyReq.setHeader('Content-Type', 'application/json');
             proxyReq.setHeader('Content-Length', Buffer.byteLength(bodyData));
             proxyReq.write(bodyData);
         }
@@ -171,16 +188,84 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
+    const hasApiKey = API_KEY ? '✓ 已从环境变量 DOUBAN_API_KEY 加载' : 'x 未配置（使用前端配置）';
     console.log(`
 ===========================================
     豆包语音问答 Demo - 本地代理服务器
 ===========================================
 服务器已启动: http://localhost:${PORT}
 
-请在浏览器中打开上述地址，即可使用。
-API Key 已从 config.local.js 读取，无需手动输入。
+流式语音识别: 已启用（边录边识别）
+
+配置状态:
+  API Key: ${hasApiKey}
 
 解决跨域问题: 通过本代理转发请求到豆包 API
 ===========================================
 `);
+});
+
+// WebSocket 代理 - 转发流式语音识别请求到火山引擎
+const wss = new WebSocket.Server({ server, path: '/api/ws-asr' });
+wss.on('connection', (ws, request) => {
+    console.log(`[${new Date().toLocaleTimeString()}] WebSocket 连接建立`);
+
+    // 连接到火山引擎流式 ASR 服务
+    const targetWsUrl = 'wss://openspeech.bytedance.com/api/v1/asr/ws';
+    const targetWs = new WebSocket(targetWsUrl);
+
+    // 客户端 -> 火山引擎
+    ws.on('message', (message) => {
+        if (targetWs.readyState === WebSocket.OPEN) {
+            // 如果是 JSON 启动指令且环境变量配置了 API Key，注入认证信息
+            if (typeof message === 'string' && API_KEY) {
+                try {
+                    const json = JSON.parse(message);
+                    if (json.app && API_KEY) {
+                        json.app.token = API_KEY;
+                        if (ASR_MODEL_ID) {
+                            json.app.appid = ASR_MODEL_ID;
+                        }
+                        message = JSON.stringify(json);
+                    }
+                } catch (e) {
+                    // 不是 JSON，直接发送
+                }
+            }
+            targetWs.send(message);
+        }
+    });
+
+    // 火山引擎 -> 客户端
+    targetWs.on('message', (message) => {
+        if (ws.readyState === WebSocket.OPEN) {
+            // 火山引擎返回 JSON，直接转发
+            if (typeof message === 'string') {
+                ws.send(message);
+            } else {
+                // 二进制响应，日志
+                console.log('收到二进制响应，大小:', message.length);
+            }
+        }
+    });
+
+    // 错误处理
+    ws.on('close', () => {
+        console.log(`[${new Date().toLocaleTimeString()}] WebSocket 连接关闭`);
+        targetWs.close();
+    });
+
+    targetWs.on('close', () => {
+        ws.close();
+    });
+
+    ws.on('error', (error) => {
+        console.error('客户端 WebSocket 错误:', error);
+        targetWs.close();
+    });
+
+    targetWs.on('error', (error) => {
+        console.error('目标服务器 WebSocket 错误:', error);
+        ws.close();
+    });
 });
