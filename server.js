@@ -229,34 +229,44 @@ const wss = new WebSocket.Server({ server, path: '/api/ws-asr' });
 wss.on('connection', (ws, request) => {
     console.log(`[${new Date().toLocaleTimeString()}] WebSocket 连接建立`);
     let seq = 1;
+    let messageQueue = []; // 缓存消息，等待火山连接打开
 
     // 连接到火山引擎流式 ASR 服务 - 使用最新 v3 大模型端点
     // 需要添加认证头
     const uuid = require('uuid');
 
     // 获取实际的认证信息
-    let actualAppId = ASR_MODEL_ID;
-    let actualToken = API_KEY;
+    // 根据官方示例:
+    // - X-Api-App-Key = APP ID (应用ID)
+    // - X-Api-Access-Key = Access Token
+    // - X-Api-Resource-Id = 资源ID (volc.* 格式)
+    let appId = null;
+    let accessToken = null;
+    let resourceId = 'volc.bigasr.sauc.duration';
 
-    // 总是尝试从 config.local.js 获取覆盖环境变量
+    // 从环境变量读取
+    if (process.env.APP_ID) appId = process.env.APP_ID;
+    if (process.env.DOUBAN_API_KEY) accessToken = process.env.DOUBAN_API_KEY;
+
+    // 从 config.local.js 读取
     try {
         const fs = require('fs');
         const configPath = path.join(__dirname, 'config.local.js');
         if (fs.existsSync(configPath)) {
             let configContent = fs.readFileSync(configPath, 'utf8');
-            // 提取 CONFIG 对象
             const match = configContent.match(/const\s+CONFIG\s*=\s*({[^}]+});/);
             if (match) {
                 try {
-                    // 简单解析，其实应该用 vm，但这里够用了
                     const evalConfig = eval('(' + match[1] + ')');
-                    if (evalConfig.ASR_MODEL_ID) {
-                        actualAppId = evalConfig.ASR_MODEL_ID;
+                    if (evalConfig.APP_ID) {
+                        appId = evalConfig.APP_ID;
+                    } else if (evalConfig.ASR_MODEL_ID) {
+                        appId = evalConfig.ASR_MODEL_ID;
                     }
                     if (evalConfig.DOUBAN_API_KEY) {
-                        actualToken = evalConfig.DOUBAN_API_KEY;
+                        accessToken = evalConfig.DOUBAN_API_KEY;
                     }
-                    console.log(`[${new Date().toLocaleTimeString()}] 从 config.local.js 加载配置: ASR_MODEL_ID=${actualAppId}`);
+                    console.log(`[${new Date().toLocaleTimeString()}] 从 config.local.js 加载配置完成`);
                 } catch (e) {
                     console.log(`[${new Date().toLocaleTimeString()}] 解析 config.local.js 失败: ${e.message}`);
                 }
@@ -265,19 +275,30 @@ wss.on('connection', (ws, request) => {
     } catch (e) {
         console.log(`[${new Date().toLocaleTimeString()}] 读取 config.local.js 失败: ${e.message}`);
     }
-    console.log(`[${new Date().toLocaleTimeString()}] 最终认证配置:`);
-    console.log(`  ASR_APP_ID (X-Api-App-Key): ${actualAppId}`);
-    console.log(`  ACCESS_TOKEN (X-Api-Access-Key): ${actualToken}`);
 
-    // 固定 URL，endpoint id 在请求 payload 中
+    // 对于 ASR 2.0 (ep- 前缀的 endpoint ID)，Resource-Id 需要使用 seedasr
+    if (appId.startsWith('ep-')) {
+        resourceId = 'volc.seedasr.sauc.duration';
+    } else {
+        resourceId = 'volc.bigasr.sauc.duration';
+    }
+
+    console.log(`[${new Date().toLocaleTimeString()}] 最终认证配置:`);
+    console.log(`  X-Api-App-Key: ${appId}`);
+    console.log(`  X-Api-Resource-Id: ${resourceId}`);
+    console.log(`  X-Api-Access-Key: ${accessToken}`);
+
+    // 固定 URL
     const targetWsUrl = 'wss://openspeech.bytedance.com/api/v3/sauc/bigmodel';
 
     const reqid = uuid.v4();
+    // 根据官方 Python 示例，头字段包括 X-Api-Access-Key
     const headers = {
-        'X-Api-Resource-Id': 'volc.bigasr.sauc.duration',
+        'X-Api-App-Key': appId,
+        'X-Api-Resource-Id': resourceId,
         'X-Api-Request-Id': reqid,
-        'X-Api-Access-Key': actualToken,
-        'X-Api-App-Key': actualAppId
+        'X-Api-Access-Key': accessToken,
+        'X-Api-Connect-Id': reqid
     };
 
     console.log(`[${new Date().toLocaleTimeString()}] 请求头:`, JSON.stringify(headers));
@@ -285,10 +306,8 @@ wss.on('connection', (ws, request) => {
     const targetWs = new WebSocket(targetWsUrl, { headers: headers });
 
     // 构建首包请求
-    function buildFullRequest(appId, token) {
+    function buildFullRequest() {
         // 使用已经读取好的全局配置
-        const currentActualAppId = actualAppId;
-        const currentActualToken = actualToken;
 
         const payload = {
             user: {
@@ -310,14 +329,7 @@ wss.on('connection', (ws, request) => {
             }
         };
 
-        // 添加认证信息，认证已经通过headers了，这里不需要重复？
-        // 不对，协议要求必须带
-        payload.app = {
-            appid: '',
-            token: currentActualToken,
-            cluster: currentActualAppId
-        };
-
+        // 认证信息已经通过 HTTP Header 传递，payload 不需要重复
         const payloadBytes = Buffer.from(JSON.stringify(payload), 'utf8');
         const compressedPayload = zlib.gzipSync(payloadBytes);
         const payloadSize = compressedPayload.length;
@@ -357,7 +369,8 @@ wss.on('connection', (ws, request) => {
         const header = Buffer.alloc(4);
         header[0] = (ProtocolVersion.V1 << 4) | 1;
         header[1] = (MessageType.CLIENT_AUDIO_ONLY_REQUEST << 4) | flags;
-        header[2] = (SerializationType.JSON << 4) | CompressionType.GZIP;
+        // Audio only request: no serialization (0b0000), payload is compressed audio bytes
+        header[2] = (0 << 4) | CompressionType.GZIP;
         header[3] = 0x00;
 
         const request = Buffer.alloc(header.length + 4 + 4 + compressedSegment.length);
@@ -381,37 +394,69 @@ wss.on('connection', (ws, request) => {
         const serializationMethod = (msgBuffer[2] >> 4);
         const compression = msgBuffer[2] & 0x0f;
 
+        console.log(`[DEBUG] parseResponse: buffer length=${msgBuffer.length}`);
+        console.log(`[DEBUG] headerSize=${headerSize}, messageType=${messageType}, flags=${flags}, serialization=${serializationMethod}, compression=${compression}`);
+
         offset += headerSize;
 
         let payloadSequence = 0;
         let isLastPackage = false;
         if ((flags & 0x01) !== 0) {
             payloadSequence = msgBuffer.readInt32BE(offset);
+            console.log(`[DEBUG] flags&0x01: payloadSequence=${payloadSequence}, offset after=${offset + 4}`);
             offset += 4;
         }
         if ((flags & 0x02) !== 0) {
             isLastPackage = true;
+            console.log(`[DEBUG] flags&0x02: isLastPackage=true`);
+        }
+        // 文档说：如果 (flags & 0x04) !== 0，则 4 字节 event 跟随
+        if ((flags & 0x04) !== 0) {
+            console.log(`[DEBUG] flags&0x04: skipping 4 bytes event, offset after=${offset + 4}`);
+            // event 字段存在，跳过这 4 字节
+            offset += 4;
         }
 
         let payloadSize = 0;
         if (messageType === 0b1001) { // SERVER_FULL_RESPONSE
             payloadSize = msgBuffer.readUInt32BE(offset);
+            console.log(`[DEBUG] messageType=1001 (SERVER_FULL_RESPONSE): payloadSize=${payloadSize}, offset after=${offset + 4}`);
             offset += 4;
+        } else if (messageType === 0b1111) { // SERVER_ERROR_RESPONSE
+            const errorCode = msgBuffer.readUInt32BE(offset);
+            offset += 4;
+            payloadSize = msgBuffer.readUInt32BE(offset);
+            offset += 4;
+            console.log(`[DEBUG] messageType=1111 (SERVER_ERROR_RESPONSE): errorCode=${errorCode}, payloadSize=${payloadSize}`);
         }
 
-        const payload = msgBuffer.slice(offset);
+        let payload;
+        if (payloadSize > 0 && (messageType === 0b1001 || messageType === 0b1111)) {
+            payload = msgBuffer.slice(offset, offset + payloadSize);
+            console.log(`[DEBUG] sliced payload: offset=${offset}, size=${payload.length} (expected ${payloadSize})`);
+        } else {
+            payload = msgBuffer.slice(offset);
+            console.log(`[DEBUG] sliced to end: payload size=${payload.length}`);
+        }
 
         if (compression === CompressionType.GZIP) {
             try {
+                const beforeLen = payload.length;
                 payload = zlib.gunzipSync(payload);
+                console.log(`[DEBUG] gunzip: compressed ${beforeLen} → uncompressed ${payload.length}`);
             } catch (e) {
                 console.error('解压失败:', e);
+                console.error(`offset=${offset}, payloadSize=${payloadSize}, buffer length=${msgBuffer.length}, payload length=${payload.length}`);
                 return null;
             }
         }
 
+        console.log(`[DEBUG] final payload length=${payload.length}, serializationMethod=${serializationMethod}`);
+
         if (serializationMethod === SerializationType.JSON) {
             try {
+                console.log(`[DEBUG] payload first 100 bytes hex: ${payload.slice(0, 100).toString('hex')}`);
+                console.log(`[DEBUG] payload as text: ${payload.toString('utf8').slice(0, 200)}...`);
                 const json = JSON.parse(payload.toString('utf8'));
                 // 转换为前端期望的格式
                 // 前端期望: { payload: { result: { text, done } } }
@@ -438,25 +483,31 @@ wss.on('connection', (ws, request) => {
         return null;
     }
 
+    // 客户端消息缓存，等待火山连接打开
+    let pendingMessages = [];
+    let processedFirst = false;
+
     // 客户端 -> 火山引擎
     ws.on('message', (message) => {
         if (targetWs.readyState !== WebSocket.OPEN) {
+            pendingMessages.push(message);
+            console.log(`[${new Date().toLocaleTimeString()}] 连接未就绪，消息已缓存，队列长度=${pendingMessages.length}`);
             return;
         }
 
+        processClientMessage(message);
+    });
+
+    function processClientMessage(message) {
         if (typeof message === 'string') {
             // 这是首包JSON启动信息，需要按照火山协议重新打包
             try {
-                const json = JSON.parse(message);
-                console.log(`[${new Date().toLocaleTimeString()}] 收到客户端启动请求，重新打包协议`);
-
-                const appId = json.app && json.app.appid ? json.app.appid : '';
-                const token = json.app && json.app.token ? json.app.token : '';
-
-                const binaryRequest = buildFullRequest(appId, token);
+                console.log(`[${new Date().toLocaleTimeString()}] 处理客户端启动请求`);
+                seq = 1;
+                processedFirst = true;
+                const binaryRequest = buildFullRequest();
                 console.log(`[${new Date().toLocaleTimeString()}] 发送首包，大小=${binaryRequest.length} bytes`);
                 targetWs.send(binaryRequest);
-                seq = 1;
             } catch (e) {
                 console.error('处理客户端启动消息失败:', e);
             }
@@ -470,6 +521,17 @@ wss.on('connection', (ws, request) => {
             }
             targetWs.send(binaryRequest);
         }
+    }
+
+    // 火山连接打开后，发送所有缓存消息按顺序
+    targetWs.on('open', () => {
+        console.log(`[${new Date().toLocaleTimeString()}] 已成功连接火山引擎 ASR 服务`);
+        console.log(`[${new Date().toLocaleTimeString()}] 发送缓存消息，共 ${pendingMessages.length} 条`);
+        // 按原来的顺序依次发送
+        for (const msg of pendingMessages) {
+            processClientMessage(msg);
+        }
+        pendingMessages = null;
     });
 
     // 火山引擎 -> 客户端
@@ -488,9 +550,7 @@ wss.on('connection', (ws, request) => {
     });
 
     // 错误处理
-    targetWs.on('open', () => {
-        console.log(`[${new Date().toLocaleTimeString()}] 已成功连接火山引擎 ASR 服务`);
-    });
+    // (连接打开处理已经在上面了，包含缓存发送)
 
     targetWs.on('close', (code, reason) => {
         console.log(`[${new Date().toLocaleTimeString()}] 火山引擎 ASR 连接关闭: code=${code}, reason=${reason}`);

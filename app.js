@@ -66,6 +66,7 @@ class VoiceQA {
         });
 
         this.clearLogBtn.addEventListener('click', () => this.clearLogs());
+        document.getElementById('downloadWavBtn').addEventListener('click', () => this.downloadCurrentRecording());
     }
 
     log(level, message) {
@@ -465,6 +466,80 @@ class VoiceQA {
 
     showResult(text, element) {
         element.textContent = text;
+    }
+
+    // 将当前录制的音频下载为 16kHz 16bit 单声道 WAV 文件
+    downloadCurrentRecording() {
+        if (this.audioBuffer.length === 0) {
+            alert('没有录音数据，请先录音');
+            return;
+        }
+
+        // this.audioBuffer 已经是 Int16Array 数组，每个元素是一个采样点
+        const pcmData = new Int16Array(this.audioBuffer);
+        const wavBlob = this.encodeWav(pcmData, this.targetSampleRate, 16, 1);
+
+        const url = URL.createObjectURL(wavBlob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'test.wav';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+
+        this.log('info', '录音已下载为 test.wav，可以用于 Python demo 测试');
+    }
+
+    // 编码为 WAV 格式
+    encodeWav(samples, sampleRate, bitsPerSample, channels) {
+        const bytesPerSample = bitsPerSample / 8;
+        const byteRate = sampleRate * channels * bytesPerSample;
+        const dataSize = samples.length * bytesPerSample;
+        const buffer = new ArrayBuffer(44 + dataSize);
+        const view = new DataView(buffer);
+
+        /* RIFF identifier */
+        this.writeString(view, 0, 'RIFF');
+        /* file length */
+        view.setUint32(4, 36 + dataSize, true);
+        /* RIFF type */
+        this.writeString(view, 8, 'WAVE');
+        /* format chunk identifier */
+        this.writeString(view, 12, 'fmt ');
+        /* format chunk length */
+        view.setUint32(16, 16, true);
+        /* sample format (raw) */
+        view.setUint16(20, 1, true);
+        /* number of channels */
+        view.setUint16(22, channels, true);
+        /* sample rate */
+        view.setUint32(24, sampleRate, true);
+        /* byte rate */
+        view.setUint32(28, byteRate, true);
+        /* block align */
+        view.setUint16(32, channels * bytesPerSample, true);
+        /* bits per sample */
+        view.setUint16(34, bitsPerSample, true);
+        /* data chunk identifier */
+        this.writeString(view, 36, 'data');
+        /* data chunk length */
+        view.setUint32(40, dataSize, true);
+
+        // 写入 PCM 数据
+        let offset = 44;
+        for (let i = 0; i < samples.length; i++) {
+            view.setInt16(offset, samples[i], true);
+            offset += 2;
+        }
+
+        return new Blob([buffer], { type: 'audio/wav' });
+    }
+
+    writeString(view, offset, string) {
+        for (let i = 0; i < string.length; i++) {
+            view.setUint8(offset + i, string.charCodeAt(i));
+        }
     }
 }
 
